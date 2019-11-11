@@ -1,6 +1,7 @@
 #include "ClusterCopier.h"
 
 #include <chrono>
+#include <optional>
 #include <Poco/Util/XMLConfiguration.h>
 #include <Poco/Logger.h>
 #include <Poco/ConsoleChannel.h>
@@ -174,6 +175,7 @@ struct ShardPartition
 
     String getPartitionPath() const;
     String getCommonPartitionIsDirtyPath() const;
+    String getCommonPartitionIsCleanedPath() const;
     String getPartitionActiveWorkersPath() const;
     String getActiveWorkerPath() const;
     String getPartitionShardsPath() const;
@@ -433,8 +435,9 @@ String ShardPartition::getPartitionPath() const
 
 String ShardPartition::getShardStatusPath() const
 {
-    // /root/table_test.hits/201701/1
-    return getPartitionPath() + "/shards/" + toString(task_shard.numberInCluster());
+    // schema: /<root...>/tables/<table>/<partition>/shards/<shard>
+    // e.g. /root/table_test.hits/201701/shards/1
+    return getPartitionShardsPath() + "/" + toString(task_shard.numberInCluster());
 }
 
 String ShardPartition::getPartitionShardsPath() const
@@ -455,6 +458,10 @@ String ShardPartition::getActiveWorkerPath() const
 String ShardPartition::getCommonPartitionIsDirtyPath() const
 {
     return getPartitionPath() + "/is_dirty";
+}
+
+String getCommonPartitionIsCleanedPath() const {
+    return getCommonPartitionIsDirtyPath() + "/cleaned";
 }
 
 String TaskTable::getPartitionIsDirtyPath(const String & partition_name) const
@@ -1124,9 +1131,9 @@ protected:
     }
 
     /** Checks that the whole partition of a table was copied. We should do it carefully due to dirty lock.
-     * State of some task could be changed during the processing.
-     * We have to ensure that all shards have the finished state and there are no dirty flag.
-     * Moreover, we have to check status twice and check zxid, because state could be changed during the checking.
+     * State of some task could change during the processing.
+     * We have to ensure that all shards have the finished state and there is no dirty flag.
+     * Moreover, we have to check status twice and check zxid, because state can change during the checking.
      */
     bool checkPartitionIsDone(const TaskTable & task_table, const String & partition_name, const TasksShard & shards_with_partition)
     {
@@ -1165,6 +1172,7 @@ protected:
             }
 
             // Check that partition is not dirty
+            // TODO: @dingxiangfei2009 CHANGE THIS
             if (zookeeper->exists(task_table.getPartitionIsDirtyPath(partition_name)))
             {
                 LOG_INFO(log, "Partition " << partition_name << " become dirty");
@@ -1255,6 +1263,7 @@ protected:
         return res;
     }
 
+    /// TODO: @dingxiangfei2009 CHANGE THIS
     bool tryDropPartition(ShardPartition & task_partition, const zkutil::ZooKeeperPtr & zookeeper)
     {
         if (is_safe_mode)
@@ -1289,7 +1298,7 @@ protected:
         {
             if (stat.numChildren != 0)
             {
-                LOG_DEBUG(log, "Partition " << task_partition.name << " contains " << stat.numChildren << " active workers, sleep");
+                LOG_DEBUG(log, "Partition " << task_partition.name << " contains " << stat.numChildren << " active workers while trying to drop it. Going to sleep.");
                 std::this_thread::sleep_for(default_sleep_time);
                 return false;
             }
@@ -1427,7 +1436,7 @@ protected:
             cluster_partition.elapsed_time_seconds += watch.elapsedSeconds();
 
             /// Check that whole cluster partition is done
-            /// Firstly check number failed partition tasks, than look into ZooKeeper and ensure that each partition is done
+            /// Firstly check the number of failed partition tasks, then look into ZooKeeper and ensure that each partition is done
             bool partition_is_done = num_failed_shards == 0;
             try
             {
@@ -1488,6 +1497,88 @@ protected:
         Error,
     };
 
+    struct LogicalClock {
+        std::optional<UInt64> zxid;
+
+        LogicalClock()
+            : zxid()
+        {}
+
+        LogicalClock(UInt64 zxid)
+            : zxid(zxid)
+        {}
+        // happens-before relation with a reasonable time bound
+        bool happensBefore(const struct LogicalClock & other) const {
+            const UInt64 HALF = 1 << 63;
+            return
+                !zxid ||
+                (other.zxid && *zxid <= *other.zxid && *other.zxid - *zxid < HALF) ||
+                (other.zxid && *zxid >= *other.zxid && *zxid - *other.zxid > HALF);
+        }
+        bool operator<=(const struct LogicalClock & other) const {
+            return happensBefore(other);
+        }
+
+        // strict equality check
+        bool operator==(const struct LogicalClock & other) const {
+            return zxid == other.zxid;
+        }
+    };
+
+    struct CleanStateClock {
+        LogicalClock discovery_zxid;
+        std::optinal<UInt32> discovery_version;
+
+        LogicalClock clean_state_zxid;
+        std::optinal<UInt32> clean_state_version;
+
+        std::shared_ptr<bool> dirty;
+
+        bool is_clean() const {
+            return !*dirty && discovery_zxid < clean_state_zxid;
+        }
+
+        CleanStateClock(
+                        const zkutil::ZooKeeperPtr & zookeeper,
+                        const String & discovery_path,
+                        const String & clean_state_path)
+            : dirty(std::make_shared(false))
+        {
+            Coordination::Stat stat;
+            String _some_data;
+            auto dirty = this->dirty;
+            auto watch_callback = [dirty] (const Coordination::WatchResponse & rsp) {
+                                      if (rsp.error == Coordination::ZOK)
+                                          switch rsp.type {
+                                          case Coordination::CREATED:
+                                          case Coordination::CHANGED:
+                                              dirty = true;
+                                          }
+                                  };
+            if (zookeeper->tryGet(discovery_path, _some_data, &stat, watch_callback)) {
+                discovery_zxid = LogicalClock(stat.mzxid);
+                discovery_version = stat.version;
+            }
+            if (zookeeper->tryGet(clean_state_path, _some_data, &stat, watch_callback)) {
+                clean_state_zxid = LogicalClock(stat.mzxid);
+                clean_state_version = stat.version;
+            }
+        }
+
+        bool operator==(const struct CleanStateClock & other) const {
+            !*dirty
+                && !*other.dirty
+                && discovery_zxid == other.discovery_zxid
+                && discovery_version == other.discovery_version
+                && clean_state_zxid == other.clean_state_zxid
+                && clean_state_version == other.clean_state_version
+        }
+
+        bool operator!=(const struct CleanStateClock & other) const {
+            !(*this == other)
+        }
+    };
+
     PartitionTaskStatus tryProcessPartitionTask(const ConnectionTimeouts & timeouts, ShardPartition & task_partition, bool is_unprioritized_task)
     {
         PartitionTaskStatus res;
@@ -1523,18 +1614,20 @@ protected:
 
         auto zookeeper = context.getZooKeeper();
 
-        String is_dirty_flag_path = task_partition.getCommonPartitionIsDirtyPath();
-        String current_task_is_active_path = task_partition.getActiveWorkerPath();
-        String current_task_status_path = task_partition.getShardStatusPath();
+        const String is_dirty_flag_path = task_partition.getCommonPartitionIsDirtyPath();
+        const String is_dirt_cleaned_path = task_partition.getCommonPartitionIsCleanedPath();
+        const String current_task_is_active_path = task_partition.getActiveWorkerPath();
+        const String current_task_status_path = task_partition.getShardStatusPath();
 
         /// Auxiliary functions:
 
         /// Creates is_dirty node to initialize DROP PARTITION
-        auto create_is_dirty_node = [&] ()
+        auto create_is_dirty_node = [&, this] (const CleanStateClock & clock)
         {
-            auto code = zookeeper->tryCreate(is_dirty_flag_path, current_task_status_path, zkutil::CreateMode::Persistent);
-            if (code && code != Coordination::ZNODEEXISTS)
-                throw Coordination::Exception(code, is_dirty_flag_path);
+            if (clock.discovery_zxid)
+                zookeeper->create(is_dirty_flag_path, host_id, zkutil::CreateMode::Persistent);
+            else
+                zookeeper->set(is_dirty_flag_path, host_id, *clock.discovery_version);
         };
 
         /// Returns SELECT query filtering current partition and applying user filter
@@ -1559,7 +1652,8 @@ protected:
         LOG_DEBUG(log, "Processing " << current_task_status_path);
 
         /// Do not start if partition is dirty, try to clean it
-        if (zookeeper->exists(is_dirty_flag_path))
+        CleanStateClock clean_state_clock (zookeeper, is_dirty_flag_path, is_dirt_cleaned_path);
+        if (!clean_state_clock.is_clean())
         {
             LOG_DEBUG(log, "Partition " << task_partition.name << " is dirty, try to drop it");
 
@@ -1593,7 +1687,8 @@ protected:
             throw;
         }
 
-        /// Exit if task has been already processed, create blocking node if it is abandoned
+        /// Exit if task has been already processed;
+        /// create blocking node to signal cleaning up if it is abandoned
         {
             String status_data;
             if (zookeeper->tryGet(current_task_status_path, status_data))
@@ -1608,12 +1703,18 @@ protected:
                 // Task is abandoned, initialize DROP PARTITION
                 LOG_DEBUG(log, "Task " << current_task_status_path << " has not been successfully finished by " << status.owner);
 
-                create_is_dirty_node();
+                create_is_dirty_node(clean_state_clock);
                 return PartitionTaskStatus::Error;
             }
         }
 
         zookeeper->createAncestors(current_task_status_path);
+        LogicalClock task_start_clock;
+        {
+            Coordination::Stat stat;
+            if (zookeeper->exists(task_partition.getShardStatusPath(), &stat))
+                task_start_clock = LogicalClock(stat.mzxid);
+        }
 
         /// We need to update table definitions for each partition, it could be changed after ALTER
         createShardInternalTables(timeouts, task_shard);
@@ -1638,36 +1739,47 @@ protected:
                 Coordination::Stat stat_shards;
                 zookeeper->get(task_partition.getPartitionShardsPath(), &stat_shards);
 
+                /// TODO: @dingxiangfei2009 CHANGE THIS
+                /// NOTE: partition is still fresh if dirt discovery happens before cleaning
                 if (stat_shards.numChildren == 0)
                 {
-                    LOG_WARNING(log, "There are no any workers for partition " << task_partition.name
+                    LOG_WARNING(log, "There are no workers for partition " << task_partition.name
                                      << ", but destination table contains " << count << " rows"
                                      << ". Partition will be dropped and refilled.");
 
-                    create_is_dirty_node();
+                    create_is_dirty_node(clean_state_clock);
+                    return PartitionTaskStatus::Error;
+                }
+                else if (task_start_clock <= clean_state_clock.discovery_mzxid)
+                {
+                    LOG_WARNING(log,
+                                "While some workers have started working on partition " << task_partition.name
+                                << " and transferred "
+                                << count << " rows, this partition is marked dirty and will be dropped and refilled.");
+                    create_is_dirty_node(clean_state_clock);
                     return PartitionTaskStatus::Error;
                 }
             }
         }
+        /// At this point, we need to sync that the destination table is clean
+        /// before any actual work
 
         /// Try start processing, create node about it
         {
             String start_state = TaskStateWithOwner::getData(TaskState::Started, host_id);
-            auto op_create = zkutil::makeCreateRequest(current_task_status_path, start_state, zkutil::CreateMode::Persistent);
-            MultiTransactionInfo info = checkNoNodeAndCommit(zookeeper, is_dirty_flag_path, std::move(op_create));
-
-            if (info.code)
+            CleanStateClock new_clean_state_clock (zookeeper, is_dirty_flag_path, is_dirt_cleaned_path);
+            if (clean_state_clock != new_clean_state_clock)
             {
-                zkutil::KeeperMultiException exception(info.code, info.requests, info.responses);
-
-                if (exception.getPathForFirstFailedOp() == is_dirty_flag_path)
-                {
-                    LOG_INFO(log, "Partition " << task_partition.name << " is dirty and will be dropped and refilled");
-                    return PartitionTaskStatus::Error;
-                }
-
-                throw exception;
+                LOG_INFO(log, "Partition " << task_partition.name << " clean state changed, cowardly bailing");
+                return PartitionTaskStatus::Error;
             }
+            else if (!new_clean_state_clock.is_clean())
+            {
+                LOG_INFO(log, "Partition " << task_partition.name << " is dirty and will be dropped and refilled");
+                create_is_dirty_node(new_clean_state_clock);
+                return PartitionTaskStatus::Error;
+            }
+            zookeeper->create(current_task_status_path, start_state, zkutil::CreateMode::Persistent);
         }
 
         /// Try create table (if not exists) on each shard
@@ -1728,17 +1840,19 @@ protected:
                     output = io_insert.out;
                 }
 
+                /// Fail-fast optimization to abort copying when the current clean state expires
                 std::future<Coordination::ExistsResponse> future_is_dirty_checker;
 
                 Stopwatch watch(CLOCK_MONOTONIC_COARSE);
                 constexpr UInt64 check_period_milliseconds = 500;
 
-                /// Will asynchronously check that ZooKeeper connection and is_dirty flag appearing while copy data
+                /// Will asynchronously check that ZooKeeper connection and is_dirty flag appearing while copying data
                 auto cancel_check = [&] ()
                 {
                     if (zookeeper->expired())
                         throw Exception("ZooKeeper session is expired, cancel INSERT SELECT", ErrorCodes::UNFINISHED);
 
+                    /// TODO: @dingxiangfei2009 CHANGE THIS
                     if (!future_is_dirty_checker.valid())
                         future_is_dirty_checker = zookeeper->asyncExists(is_dirty_flag_path);
 
@@ -1749,7 +1863,13 @@ protected:
                         Coordination::ExistsResponse status = future_is_dirty_checker.get();
 
                         if (status.error != Coordination::ZNONODE)
+                        {
+                            LogicalClock dirt_discovery_epoch (status.stat.mzxid);
+                            if (dirt_discovery_epoch == clean_state_clock.discovery_zxid) {
+                                return false;
+                            }
                             throw Exception("Partition is dirty, cancel INSERT SELECT", ErrorCodes::UNFINISHED);
+                        }
                     }
 
                     return false;
@@ -1784,20 +1904,19 @@ protected:
         /// Finalize the processing, change state of current partition task (and also check is_dirty flag)
         {
             String state_finished = TaskStateWithOwner::getData(TaskState::Finished, host_id);
-            auto op_set = zkutil::makeSetRequest(current_task_status_path, state_finished, 0);
-            MultiTransactionInfo info = checkNoNodeAndCommit(zookeeper, is_dirty_flag_path, std::move(op_set));
-
-            if (info.code)
+            CleanStateClock new_clean_state_clock (zookeeper, is_dirty_flag_path, is_dirt_cleaned_path);
+            if (clean_state_clock != new_clean_state_clock)
             {
-                zkutil::KeeperMultiException exception(info.code, info.requests, info.responses);
-
-                if (exception.getPathForFirstFailedOp() == is_dirty_flag_path)
-                    LOG_INFO(log, "Partition " << task_partition.name << " became dirty and will be dropped and refilled");
-                else
-                    LOG_INFO(log, "Someone made the node abandoned. Will refill partition. " << zkutil::ZooKeeper::error2string(info.code));
-
+                LOG_INFO(log, "Partition " << task_partition.name << " clean state changed, cowardly bailing");
                 return PartitionTaskStatus::Error;
             }
+            else if (!new_clean_state_clock.is_clean())
+            {
+                LOG_INFO(log, "Partition " << task_partition.name << " became dirty and will be dropped and refilled");
+                create_is_dirty_node(new_clean_state_clock);
+                return PartitionTaskStatus::Error;
+            }
+            zookeeper->set(current_task_status_path, state_finished, 0);
         }
 
         LOG_INFO(log, "Partition " << task_partition.name << " copied");
