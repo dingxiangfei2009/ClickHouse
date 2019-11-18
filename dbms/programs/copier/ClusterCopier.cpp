@@ -1173,7 +1173,6 @@ protected:
             }
 
             // Check that partition is not dirty
-            // TODO: @dingxiangfei2009 CHANGE THIS
             {
                 CleanStateClock clean_state_clock (
                                                    zookeeper,
@@ -1380,7 +1379,6 @@ protected:
         }
     };
 
-    /// TODO: @dingxiangfei2009 CHANGE THIS
     bool tryDropPartition(ShardPartition & task_partition, const zkutil::ZooKeeperPtr & zookeeper, const CleanStateClock & clean_state_clock)
     {
         if (is_safe_mode)
@@ -1494,29 +1492,6 @@ protected:
                 LOG_DEBUG(log, "Clean state is altered when dropping the partition, cowardly bailing");
                 /// clean state is stale
                 return false;
-            }
-
-            {
-                String query;
-                query += "SELECT count() FROM ";
-                query += getDatabaseDotTable(task_partition.task_shard.table_split_shard);
-                query += " WHERE (";
-                query += queryToString(task_partition.task_shard.task_table.engine_push_partition_key_ast);
-                query += " = ( " + task_partition.name + " AS partition_key))";
-                if (!task_table.where_condition_str.empty())
-                    query += " AND (" + task_table.where_condition_str + ")";
-                ParserQuery p_query(query.data() + query.size());
-                ASTPtr query_select_ast = parseQuery(p_query, query, 0);
-                Context local_context = context;
-                // Use pull (i.e. readonly) settings, but fetch data from destination servers
-                local_context.getSettingsRef() = task_cluster->settings_pull;
-                local_context.getSettingsRef().skip_unavailable_shards = true;
-
-                Block block = getBlockWithAllStreamData(InterpreterFactory::get(query_select_ast, local_context)->execute().in);
-                if (block && block.safeGetByPosition(0).column->getUInt(0) != 0)
-                    return false;
-                else
-                    LOG_INFO(log, "Partition " << task_partition.name << " is empty");
             }
 
             LOG_INFO(log, "Partition " << task_partition.name << " was dropped on cluster " << task_table.cluster_push_name);
@@ -1871,7 +1846,6 @@ protected:
                 Coordination::Stat stat_shards;
                 zookeeper->get(task_partition.getPartitionShardsPath(), &stat_shards);
 
-                /// TODO: @dingxiangfei2009 CHANGE THIS
                 /// NOTE: partition is still fresh if dirt discovery happens before cleaning
                 if (stat_shards.numChildren == 0)
                 {
@@ -1976,7 +1950,6 @@ protected:
                     if (zookeeper->expired())
                         throw Exception("ZooKeeper session is expired, cancel INSERT SELECT", ErrorCodes::UNFINISHED);
 
-                    /// TODO: @dingxiangfei2009 CHANGE THIS
                     if (!future_is_dirty_checker.valid())
                         future_is_dirty_checker = zookeeper->asyncExists(is_dirty_flag_path);
 
